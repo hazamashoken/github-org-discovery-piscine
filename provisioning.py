@@ -1,0 +1,175 @@
+import re
+
+
+CSV_TEMPLATE_COLUMNS = [
+    "email",
+    "intra_login",
+    "github_username",
+    "repo_name",
+    "permission",
+    "repo_type",
+]
+
+PERMISSION_PRIORITY = ["admin", "maintain", "push", "triage", "pull"]
+ALLOWED_PERMISSIONS = {"pull", "triage", "push", "maintain", "admin"}
+ALLOWED_REPO_TYPES = {"individual", "group_project"}
+
+
+def clean_text(value):
+    if value is None:
+        return ""
+    if value != value:
+        return ""
+    return str(value).strip()
+
+
+def normalize_topic(value):
+    topic = clean_text(value).lower()
+    topic = re.sub(r"[^a-z0-9-]+", "-", topic)
+    topic = re.sub(r"-+", "-", topic).strip("-")
+    return topic[:50]
+
+
+def build_repo_name(course_run, intra_login):
+    course_slug = normalize_topic(course_run)
+    login_slug = normalize_topic(intra_login)
+    if course_slug and login_slug:
+        return f"{course_slug}-{login_slug}"
+    return login_slug or course_slug
+
+
+def build_manual_row(
+    email,
+    intra_login,
+    github_username="",
+    repo_name="",
+    permission="push",
+    course_run="",
+    repo_type="individual",
+):
+    email = clean_text(email)
+    intra_login = clean_text(intra_login)
+    repo_name = clean_text(repo_name) or build_repo_name(course_run, intra_login)
+    permission = clean_text(permission) or "push"
+    repo_type = clean_text(repo_type) or "individual"
+
+    return {
+        "email": email,
+        "intra_login": intra_login,
+        "github_username": clean_text(github_username),
+        "repo_name": repo_name,
+        "permission": permission,
+        "course_run": clean_text(course_run),
+        "repo_type": repo_type,
+    }
+
+
+def validate_roster(roster, course_run=""):
+    records = roster.to_dict("records") if hasattr(roster, "to_dict") else roster
+    normalized = []
+
+    for index, row in enumerate(records, start=1):
+        email = clean_text(row.get("email"))
+        intra_login = clean_text(row.get("intra_login") or row.get("login"))
+        permission = clean_text(row.get("permission", "push")) or "push"
+        repo_type = clean_text(row.get("repo_type", "individual")) or "individual"
+
+        if not email:
+            raise ValueError(f"Row {index}: missing email")
+        if not intra_login:
+            raise ValueError(f"Row {index}: missing intra_login")
+        if permission not in ALLOWED_PERMISSIONS:
+            raise ValueError(f"Row {index}: invalid permission '{permission}'")
+        if repo_type not in ALLOWED_REPO_TYPES:
+            raise ValueError(f"Row {index}: invalid repo_type '{repo_type}'")
+
+        normalized.append(
+            build_manual_row(
+                email=email,
+                intra_login=intra_login,
+                github_username=row.get("github_username", ""),
+                repo_name=row.get("repo_name", ""),
+                permission=permission,
+                course_run=row.get("course_run", course_run),
+                repo_type=repo_type,
+            )
+        )
+
+    individual_repo_names = {}
+    for index, row in enumerate(normalized, start=1):
+        if row["repo_type"] != "individual":
+            continue
+        repo_name = row["repo_name"]
+        if repo_name in individual_repo_names:
+            first_index = individual_repo_names[repo_name]
+            raise ValueError(
+                f"Row {index}: duplicate individual repo_name '{repo_name}' "
+                f"also used on row {first_index}"
+            )
+        individual_repo_names[repo_name] = index
+
+    return normalized
+
+
+def roster_topics(course_run):
+    topics = [
+        normalize_topic(course_run),
+        "student-workspace",
+    ]
+    return [topic for topic in topics if topic]
+
+
+def select_roster_rows(roster, selected_flags):
+    return [row for row, selected in zip(roster, selected_flags) if selected]
+
+
+def unique_repo_rows(rows):
+    unique_rows = []
+    seen_repo_names = set()
+
+    for row in rows:
+        repo_name = row["repo_name"]
+        if repo_name in seen_repo_names:
+            continue
+        unique_rows.append(row)
+        seen_repo_names.add(repo_name)
+
+    return unique_rows
+
+
+def build_group_project_rows(roster_rows, repo_name, permission="push"):
+    repo_name = clean_text(repo_name)
+    permission = clean_text(permission) or "push"
+
+    return [
+        build_manual_row(
+            email=row.get("email", ""),
+            intra_login=row.get("intra_login", ""),
+            github_username=row.get("github_username", ""),
+            repo_name=repo_name,
+            permission=permission,
+            course_run=row.get("course_run", ""),
+            repo_type="group_project",
+        )
+        for row in roster_rows
+    ]
+
+
+def apply_permission(roster, permission):
+    selected_permission = clean_text(permission) or "push"
+    return [{**row, "permission": selected_permission} for row in roster]
+
+
+def csv_template():
+    return (
+        ",".join(CSV_TEMPLATE_COLUMNS)
+        + "\n"
+        + "student@example.com,jdoe,github-user,,push,individual\n"
+    )
+
+
+def effective_permission(permissions):
+    for permission in PERMISSION_PRIORITY:
+        if permissions.get(permission):
+            return permission
+    return ""
