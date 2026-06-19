@@ -1,21 +1,46 @@
 import time
+import datetime as dt
 
 import pandas as pd
 import requests
 import streamlit as st
 
+from intra import (
+    apply_intra_create_result,
+    build_intra_user_payload,
+    create_intra_user,
+    format_intra_datetime,
+    format_singapore_display,
+    get_intra_access_token,
+    load_cursus_options,
+    now_singapore,
+)
 from provisioning import (
     apply_permission,
     build_group_project_rows,
     build_manual_row,
     csv_template,
     effective_permission,
+    normalize_topic,
+    prepare_intra_user_rows,
+    prepare_individual_repo_rows,
     roster_topics,
     select_roster_rows,
     unique_repo_rows,
     validate_roster,
 )
-from storage import DEFAULT_DB_PATH, delete_roster_rows, init_db, list_roster_rows, save_roster_rows
+from storage import (
+    DEFAULT_DB_PATH,
+    archive_course_run,
+    create_course_run,
+    delete_course_run,
+    delete_roster_rows,
+    init_db,
+    list_course_runs,
+    list_roster_rows,
+    save_roster_rows,
+    update_roster_rows,
+)
 
 GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
 GITHUB_ORG = st.secrets["GITHUB_ORG"]
@@ -29,7 +54,6 @@ HEADERS = {
 }
 
 PERMISSIONS = ["push", "pull", "triage", "maintain", "admin"]
-REPO_TYPES = ["individual", "group_project"]
 
 
 def github_request(method, url, **kwargs):
@@ -287,6 +311,60 @@ def add_collaborators(roster, action_label="collaborator"):
     return results
 
 
+def create_intra_users(roster, campus_id, cursus, begin_at, end_at, course_run):
+    ok, token_or_error = get_intra_access_token(st.secrets)
+    if not ok:
+        return [], token_or_error
+
+    results = []
+    updated_rows = []
+    progress = st.progress(0)
+
+    for index, row in enumerate(roster):
+        result = {
+            **row,
+            "intra_created": False,
+            "intra_user_id": "",
+            "intra_url": "",
+            "error": "",
+        }
+
+        try:
+            payload = build_intra_user_payload(
+                row=row,
+                campus_id=campus_id,
+                cursus=cursus,
+                begin_at=begin_at,
+                end_at=end_at,
+            )
+            ok, data = create_intra_user(token_or_error, payload)
+            if ok:
+                result["intra_created"] = True
+                result["intra_user_id"] = data.get("id", "")
+                result["intra_url"] = data.get("url", "")
+                updated_row = apply_intra_create_result(
+                    row=row,
+                    result=data,
+                    course_run=course_run,
+                )
+                updated_rows.append(updated_row)
+                result["intra_login"] = updated_row["intra_login"]
+                result["repo_name"] = updated_row["repo_name"]
+            else:
+                result["error"] = f"Create Intra user failed: {data}"
+        except Exception as exc:
+            result["error"] = str(exc)
+
+        results.append(result)
+        progress.progress((index + 1) / len(roster))
+        time.sleep(0.2)
+
+    if updated_rows:
+        update_roster_rows(DEFAULT_DB_PATH, updated_rows)
+
+    return results, ""
+
+
 def update_repo_collaborators(repos, github_username, permission):
     results = []
     progress = st.progress(0)
@@ -402,6 +480,49 @@ def selected_roster_from_editor(roster, key):
     return select_roster_rows(roster, edited_df["selected"].tolist())
 
 
+def editable_identity_roster_from_editor(roster, key):
+    editor_df = pd.DataFrame({"selected": [False] * len(roster), **pd.DataFrame(roster).to_dict("list")})
+    editable_columns = {"selected", "email", "first_name", "last_name"}
+    edited_df = st.data_editor(
+        editor_df,
+        key=key,
+        width="stretch",
+        hide_index=True,
+        disabled=[column for column in editor_df.columns if column not in editable_columns],
+    )
+    edited_rows = edited_df.drop(columns=["selected"]).to_dict("records")
+    return select_roster_rows(edited_rows, edited_df["selected"].tolist())
+
+
+def editable_individual_roster_from_editor(roster, key):
+    editor_df = pd.DataFrame({"selected": [False] * len(roster), **pd.DataFrame(roster).to_dict("list")})
+    editable_columns = {"selected", "intra_login", "repo_name", "github_username", "permission"}
+    edited_df = st.data_editor(
+        editor_df,
+        key=key,
+        width="stretch",
+        hide_index=True,
+        disabled=[column for column in editor_df.columns if column not in editable_columns],
+    )
+    edited_rows = edited_df.drop(columns=["selected"]).to_dict("records")
+    selected_rows = select_roster_rows(edited_rows, edited_df["selected"].tolist())
+    return selected_rows
+
+
+def editable_intra_roster_from_editor(roster, key):
+    editor_df = pd.DataFrame({"selected": [False] * len(roster), **pd.DataFrame(roster).to_dict("list")})
+    editable_columns = {"selected", "intra_login", "github_username", "permission"}
+    edited_df = st.data_editor(
+        editor_df,
+        key=key,
+        width="stretch",
+        hide_index=True,
+        disabled=[column for column in editor_df.columns if column not in editable_columns],
+    )
+    edited_rows = edited_df.drop(columns=["selected"]).to_dict("records")
+    return select_roster_rows(edited_rows, edited_df["selected"].tolist())
+
+
 def selected_repos_from_editor(repos, key):
     editor_df = pd.DataFrame({"selected": [False] * len(repos), **pd.DataFrame(repos).to_dict("list")})
     edited_df = st.data_editor(
@@ -414,22 +535,189 @@ def selected_repos_from_editor(repos, key):
     return select_roster_rows(repos, edited_df["selected"].tolist())
 
 
+def parse_stored_datetime(value, fallback):
+    if not value:
+        return fallback
+    try:
+        utc_value = dt.datetime.strptime(value, "%Y-%m-%d %H:%M:%S UTC")
+        utc_value = utc_value.replace(tzinfo=dt.timezone.utc)
+        return utc_value.astimezone(now_singapore().tzinfo).replace(tzinfo=None)
+    except ValueError:
+        return fallback
+
+
 st.set_page_config(page_title="Repo Group Controller", layout="wide")
 init_db(DEFAULT_DB_PATH)
 st.title("Repo Group Controller")
 
 with st.sidebar:
     st.header("Course run")
-    course_run = st.text_input("Course run", value="discovery-2026")
-    repo_private = st.checkbox("Create private repositories", value=True)
-    description_prefix = st.text_input("Repo description prefix", value="Student workspace")
+    show_archived_course_runs = st.checkbox("Show archived course runs", value=False)
+    course_runs = list_course_runs(
+        DEFAULT_DB_PATH,
+        include_archived=show_archived_course_runs,
+    )
 
-st.caption(f"Managing course run `{course_run}` in GitHub org `{GITHUB_ORG}`")
+    with st.expander("Create course run", expanded=not course_runs):
+        with st.form("create_course_run"):
+            course_run_name = st.text_input("Name", value="")
+            course_run_slug = st.text_input("GitHub topic slug", value="")
+            course_run_description = st.text_area("Description", value="")
+            default_course_start = now_singapore().replace(second=0, microsecond=0)
+            default_course_end = default_course_start + dt.timedelta(days=30)
+            course_start_date = st.date_input("Start date (Asia/Singapore)", value=default_course_start.date())
+            course_start_time = st.time_input("Start time (Asia/Singapore)", value=default_course_start.time())
+            course_end_date = st.date_input("End date (Asia/Singapore)", value=default_course_end.date())
+            course_end_time = st.time_input("End time (Asia/Singapore)", value=default_course_end.time())
+            new_repo_private = st.checkbox("Default private repositories", value=True)
+            new_description_prefix = st.text_input(
+                "Repo description prefix",
+                value="Student workspace",
+            )
+            create_submitted = st.form_submit_button("Save course run")
+
+        if create_submitted:
+            slug = course_run_slug or normalize_topic(course_run_name)
+            if not course_run_name:
+                st.error("Course run name is required")
+            elif not slug:
+                st.error("GitHub topic slug is required")
+            else:
+                create_course_run(
+                    DEFAULT_DB_PATH,
+                    name=course_run_name,
+                    slug=slug,
+                    description=course_run_description,
+                    repo_private=new_repo_private,
+                    description_prefix=new_description_prefix,
+                    start_at=format_intra_datetime(course_start_date, course_start_time),
+                    end_at=format_intra_datetime(course_end_date, course_end_time),
+                )
+                st.success("Course run saved")
+                st.rerun()
+
+    course_runs = list_course_runs(
+        DEFAULT_DB_PATH,
+        include_archived=show_archived_course_runs,
+    )
+
+    if not course_runs:
+        st.warning("Create a course run before managing rosters or repositories.")
+        st.stop()
+
+    selected_course_run = st.selectbox(
+        "Select course run",
+        course_runs,
+        format_func=lambda row: f"{row['name']} ({row['slug']})",
+    )
+    course_run = selected_course_run["slug"]
+    repo_private = selected_course_run["repo_private"]
+    description_prefix = selected_course_run["description_prefix"]
+    st.caption(selected_course_run["description"] or "No description")
+    st.caption(
+        f"{format_singapore_display(selected_course_run['start_at']) or 'No start'} -> "
+        f"{format_singapore_display(selected_course_run['end_at']) or 'No end'}"
+    )
+    if selected_course_run["archived_at"]:
+        st.warning(f"Archived at {selected_course_run['archived_at']}")
+
+    with st.expander("Update selected course run"):
+        with st.form("update_course_run"):
+            fallback_start = now_singapore().replace(second=0, microsecond=0)
+            fallback_end = fallback_start + dt.timedelta(days=30)
+            selected_start = parse_stored_datetime(selected_course_run["start_at"], fallback_start)
+            selected_end = parse_stored_datetime(selected_course_run["end_at"], fallback_end)
+            updated_name = st.text_input(
+                "Name",
+                value=selected_course_run["name"],
+                key="update_course_run_name",
+            )
+            updated_description = st.text_area(
+                "Description",
+                value=selected_course_run["description"],
+                key="update_course_run_description",
+            )
+            updated_start_date = st.date_input(
+                "Start date (Asia/Singapore)",
+                value=selected_start.date(),
+                key="update_course_run_start_date",
+            )
+            updated_start_time = st.time_input(
+                "Start time (Asia/Singapore)",
+                value=selected_start.time(),
+                key="update_course_run_start_time",
+            )
+            updated_end_date = st.date_input(
+                "End date (Asia/Singapore)",
+                value=selected_end.date(),
+                key="update_course_run_end_date",
+            )
+            updated_end_time = st.time_input(
+                "End time (Asia/Singapore)",
+                value=selected_end.time(),
+                key="update_course_run_end_time",
+            )
+            updated_repo_private = st.checkbox(
+                "Default private repositories",
+                value=selected_course_run["repo_private"],
+                key="update_course_run_repo_private",
+            )
+            updated_description_prefix = st.text_input(
+                "Repo description prefix",
+                value=selected_course_run["description_prefix"],
+                key="update_course_run_description_prefix",
+            )
+            update_submitted = st.form_submit_button("Update course run")
+
+        if update_submitted:
+            if not updated_name:
+                st.error("Course run name is required")
+            else:
+                create_course_run(
+                    DEFAULT_DB_PATH,
+                    name=updated_name,
+                    slug=selected_course_run["slug"],
+                    description=updated_description,
+                    repo_private=updated_repo_private,
+                    description_prefix=updated_description_prefix,
+                    start_at=format_intra_datetime(updated_start_date, updated_start_time),
+                    end_at=format_intra_datetime(updated_end_date, updated_end_time),
+                )
+                st.success("Course run updated")
+                st.rerun()
+
+    with st.expander("Archive or delete course run"):
+        if selected_course_run["archived_at"]:
+            st.info("This course run is already archived.")
+        else:
+            if st.button("Archive selected course run"):
+                archive_course_run(DEFAULT_DB_PATH, selected_course_run["slug"])
+                st.success("Course run archived")
+                st.rerun()
+
+        st.write("Deleting also removes this course run's local roster rows.")
+        delete_phrase = st.text_input(
+            "Type DELETE COURSE RUN to confirm",
+            key="delete_course_run_phrase",
+        )
+        if st.button(
+            "Delete selected course run",
+            disabled=delete_phrase != "DELETE COURSE RUN",
+        ):
+            delete_course_run(DEFAULT_DB_PATH, selected_course_run["slug"])
+            st.success("Course run deleted")
+            st.rerun()
+
+st.caption(
+    f"Managing course run `{selected_course_run['name']}` "
+    f"with topic `{course_run}` in GitHub org `{GITHUB_ORG}`"
+)
 st.caption(f"Local DB: `{DEFAULT_DB_PATH}`")
 
-tab_roster, tab_individual, tab_group, tab_collab, tab_permission, tab_manage = st.tabs(
+tab_roster, tab_intra, tab_individual, tab_group, tab_collab, tab_permission, tab_manage = st.tabs(
     [
         "Roster",
+        "Intra users",
         "Individual repos",
         "Group project",
         "Add collaborators",
@@ -449,7 +737,7 @@ with tab_roster:
             file_name="roster_template.csv",
             mime="text/csv",
         )
-        uploaded_file = st.file_uploader("CSV columns: email, intra_login, optional github_username, repo_name, permission", type=["csv"])
+        uploaded_file = st.file_uploader("CSV columns: email, first_name, last_name", type=["csv"])
         uploaded_roster = []
         if uploaded_file:
             try:
@@ -467,23 +755,22 @@ with tab_roster:
         st.subheader("Direct entry")
         with st.form("manual_student"):
             email = st.text_input("Email")
-            intra_login = st.text_input("Intra login")
-            github_username = st.text_input("GitHub username, optional")
-            repo_name = st.text_input("Repo name, optional")
-            permission = st.selectbox("Permission", PERMISSIONS, index=0)
-            repo_type = st.selectbox("Repo type", REPO_TYPES, index=0)
+            first_name = st.text_input("First name")
+            last_name = st.text_input("Last name")
             submitted = st.form_submit_button("Save to roster")
 
         if submitted:
             try:
                 row = build_manual_row(
                     email=email,
-                    intra_login=intra_login,
-                    github_username=github_username,
-                    repo_name=repo_name,
-                    permission=permission,
+                    first_name=first_name,
+                    last_name=last_name,
+                    intra_login="",
+                    github_username="",
+                    repo_name="",
+                    permission="push",
                     course_run=course_run,
-                    repo_type=repo_type,
+                    repo_type="individual",
                 )
                 validate_roster([row], course_run=course_run)
                 save_roster_rows(DEFAULT_DB_PATH, [row])
@@ -501,8 +788,16 @@ with tab_roster:
             validate_roster(roster, course_run=course_run)
         except ValueError as exc:
             st.error(f"Saved roster validation error: {exc}")
-        selected_roster = selected_roster_from_editor(roster, "saved_roster_selection")
+        selected_roster = editable_identity_roster_from_editor(roster, "saved_roster_selection")
         st.caption(f"{len(roster)} saved rows, {len(selected_roster)} selected")
+        if st.button("Save selected identity edits", disabled=not selected_roster):
+            try:
+                validate_roster(selected_roster, course_run=course_run)
+                updated_count = update_roster_rows(DEFAULT_DB_PATH, selected_roster)
+                st.success(f"Saved identity edits for {updated_count} rows")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
         if st.button("Delete selected saved rows", disabled=not selected_roster):
             deleted_count = delete_roster_rows(
                 DEFAULT_DB_PATH,
@@ -513,27 +808,110 @@ with tab_roster:
     else:
         st.info("Upload a CSV or save a direct-entry row.")
 
+with tab_intra:
+    roster = st.session_state.get("current_roster", [])
+    st.subheader("Create intra users")
+    st.write("Select roster rows, choose a cursus and date range, then create external Intra users before repo creation.")
+
+    cursus_options = load_cursus_options()
+    campus_id = st.text_input("Campus ID", value=st.secrets.get("INTRA_CAMPUS_ID", ""))
+
+    if cursus_options:
+        selected_cursus = st.selectbox(
+            "Cursus",
+            cursus_options,
+            format_func=lambda item: f"{item['cursus_title']} ({item['cursus_id']})",
+        )
+    else:
+        selected_cursus = None
+        st.warning("No cursus options found in cursus.json")
+
+    fallback_begin = now_singapore().replace(second=0, microsecond=0)
+    fallback_end = fallback_begin + dt.timedelta(days=30)
+    course_begin = parse_stored_datetime(selected_course_run["start_at"], fallback_begin)
+    course_end = parse_stored_datetime(selected_course_run["end_at"], fallback_end)
+    use_course_datetime = st.checkbox("Use course run start/end datetime", value=True)
+
+    if use_course_datetime:
+        begin_date = course_begin.date()
+        begin_time = course_begin.time()
+        end_date = course_end.date()
+        end_time = course_end.time()
+        st.text_input("Cursus begin_at", value=format_intra_datetime(begin_date, begin_time), disabled=True)
+        st.text_input("Cursus end_at", value=format_intra_datetime(end_date, end_time), disabled=True)
+    else:
+        begin_date = st.date_input("Cursus begin date (Asia/Singapore)", value=course_begin.date())
+        begin_time = st.time_input("Cursus begin time (Asia/Singapore)", value=course_begin.time())
+        end_date = st.date_input("Cursus end date (Asia/Singapore)", value=course_end.date())
+        end_time = st.time_input("Cursus end time (Asia/Singapore)", value=course_end.time())
+
+    if roster:
+        selected_roster = editable_intra_roster_from_editor(roster, "intra_user_selection")
+        st.caption(f"{len(selected_roster)} selected")
+    else:
+        selected_roster = []
+        st.info("Build a roster first.")
+
+    if st.button("Save selected intra users", disabled=not selected_roster):
+        prepared_roster = prepare_intra_user_rows(selected_roster, course_run=course_run)
+        updated_count = update_roster_rows(DEFAULT_DB_PATH, prepared_roster)
+        st.success(f"Saved intra details for {updated_count} rows")
+        st.rerun()
+
+    create_intra_disabled = not selected_roster or not selected_cursus or not campus_id
+
+    if st.button("Create selected Intra users", disabled=create_intra_disabled):
+        begin_at = format_intra_datetime(begin_date, begin_time)
+        end_at = format_intra_datetime(end_date, end_time)
+        results, error = create_intra_users(
+            roster=selected_roster,
+            campus_id=campus_id,
+            cursus=selected_cursus,
+            begin_at=begin_at,
+            end_at=end_at,
+            course_run=course_run,
+        )
+        if error:
+            st.error(error)
+        else:
+            show_result_table("Intra user creation result", results, "intra_user_creation_result.csv")
+            st.session_state.current_roster = list_roster_rows(DEFAULT_DB_PATH, course_run)
+
 with tab_individual:
     roster = st.session_state.get("current_roster", [])
     individual_roster = [row for row in roster if row.get("repo_type") == "individual"]
     st.subheader("Create individual repositories")
-    st.write("Each selected roster row creates one individual student repository. Roster upload and direct entry only stage data; they do not create repositories.")
+    st.write("Select roster rows, fill intra login if missing, then save the repo details or create repositories.")
 
     if individual_roster:
-        selected_roster = selected_roster_from_editor(individual_roster, "individual_repo_selection")
+        selected_roster = editable_individual_roster_from_editor(individual_roster, "individual_repo_selection")
         st.caption(f"{len(selected_roster)} selected")
     else:
         selected_roster = []
         st.info("Build a roster with individual rows first.")
 
+    if st.button("Save selected repo details", disabled=not selected_roster):
+        try:
+            prepared_roster = prepare_individual_repo_rows(selected_roster, course_run=course_run)
+            updated_count = update_roster_rows(DEFAULT_DB_PATH, prepared_roster)
+            st.success(f"Saved repo details for {updated_count} rows")
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
     if st.button("Create selected individual repos", disabled=not selected_roster):
-        results = create_repositories(
-            roster=selected_roster,
-            course_run=course_run,
-            description_prefix=description_prefix,
-            repo_private=repo_private,
-        )
-        show_result_table("Individual repo result", results, "individual_repo_creation_result.csv")
+        try:
+            prepared_roster = prepare_individual_repo_rows(selected_roster, course_run=course_run)
+            update_roster_rows(DEFAULT_DB_PATH, prepared_roster)
+            results = create_repositories(
+                roster=prepared_roster,
+                course_run=course_run,
+                description_prefix=description_prefix,
+                repo_private=repo_private,
+            )
+            show_result_table("Individual repo result", results, "individual_repo_creation_result.csv")
+        except ValueError as exc:
+            st.error(str(exc))
 
 with tab_group:
     roster = st.session_state.get("current_roster", [])

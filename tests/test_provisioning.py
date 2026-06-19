@@ -7,6 +7,8 @@ from provisioning import (
     csv_template,
     effective_permission,
     normalize_topic,
+    prepare_intra_user_rows,
+    prepare_individual_repo_rows,
     roster_topics,
     select_roster_rows,
     unique_repo_rows,
@@ -18,6 +20,8 @@ class ProvisioningTest(unittest.TestCase):
     def test_build_manual_row_uses_intra_login_for_default_repo_name(self):
         row = build_manual_row(
             email=" student@example.com ",
+            first_name=" Jane ",
+            last_name=" Smith ",
             intra_login=" JSmith ",
             github_username="",
             course_run="Discovery 2026",
@@ -27,7 +31,10 @@ class ProvisioningTest(unittest.TestCase):
             row,
             {
                 "email": "student@example.com",
+                "first_name": "Jane",
+                "last_name": "Smith",
                 "intra_login": "JSmith",
+                "intra_user_id": "",
                 "github_username": "",
                 "repo_name": "discovery-2026-jsmith",
                 "permission": "push",
@@ -40,16 +47,88 @@ class ProvisioningTest(unittest.TestCase):
         records = [
             {
                 "email": "student@example.com",
+                "first_name": "John",
+                "last_name": "Doe",
                 "intra_login": "jdoe",
             }
         ]
 
         roster = validate_roster(records, course_run="Discovery 2026")
 
+        self.assertEqual(roster[0]["first_name"], "John")
+        self.assertEqual(roster[0]["last_name"], "Doe")
         self.assertEqual(roster[0]["github_username"], "")
         self.assertEqual(roster[0]["repo_name"], "discovery-2026-jdoe")
         self.assertEqual(roster[0]["permission"], "push")
         self.assertEqual(roster[0]["repo_type"], "individual")
+
+    def test_validate_roster_allows_identity_only_row(self):
+        roster = validate_roster(
+            [
+                {
+                    "email": "student@example.com",
+                    "first_name": "John",
+                    "last_name": "Doe",
+                }
+            ],
+            course_run="Discovery 2026",
+        )
+
+        self.assertEqual(roster[0]["intra_login"], "")
+        self.assertEqual(roster[0]["repo_name"], "")
+
+    def test_prepare_individual_repo_rows_requires_intra_or_repo_name(self):
+        with self.assertRaisesRegex(ValueError, "missing repo_name"):
+            prepare_individual_repo_rows(
+                [
+                    {
+                        "email": "student@example.com",
+                        "first_name": "John",
+                        "last_name": "Doe",
+                    }
+                ],
+                course_run="Discovery 2026",
+            )
+
+    def test_prepare_individual_repo_rows_derives_repo_name_after_intra_is_filled(self):
+        prepared = prepare_individual_repo_rows(
+            [
+                {
+                    "email": "student@example.com",
+                    "first_name": "John",
+                    "last_name": "Doe",
+                    "intra_login": "jdoe",
+                    "repo_name": "",
+                    "permission": "push",
+                    "course_run": "Discovery 2026",
+                    "repo_type": "individual",
+                }
+            ],
+            course_run="Discovery 2026",
+        )
+
+        self.assertEqual(prepared[0]["repo_name"], "discovery-2026-jdoe")
+
+    def test_prepare_intra_user_rows_derives_repo_name_when_intra_is_filled(self):
+        prepared = prepare_intra_user_rows(
+            [
+                {
+                    "email": "student@example.com",
+                    "first_name": "John",
+                    "last_name": "Doe",
+                    "intra_login": "jdoe",
+                    "github_username": "octocat",
+                    "repo_name": "",
+                    "permission": "push",
+                    "course_run": "Discovery 2026",
+                    "repo_type": "individual",
+                }
+            ],
+            course_run="Discovery 2026",
+        )
+
+        self.assertEqual(prepared[0]["intra_login"], "jdoe")
+        self.assertEqual(prepared[0]["repo_name"], "discovery-2026-jdoe")
 
     def test_validate_roster_rejects_invalid_permission(self):
         with self.assertRaisesRegex(ValueError, "invalid permission"):
@@ -123,14 +202,20 @@ class ProvisioningTest(unittest.TestCase):
             [
                 {
                     "email": "one@example.com",
+                    "first_name": "One",
+                    "last_name": "Student",
                     "intra_login": "one",
+                    "intra_user_id": "",
                     "github_username": "one-gh",
                     "permission": "pull",
                     "course_run": "Discovery 2026",
                 },
                 {
                     "email": "two@example.com",
+                    "first_name": "Two",
+                    "last_name": "Student",
                     "intra_login": "two",
+                    "intra_user_id": "",
                     "github_username": "two-gh",
                     "permission": "pull",
                     "course_run": "Discovery 2026",
@@ -145,7 +230,10 @@ class ProvisioningTest(unittest.TestCase):
             [
                 {
                     "email": "one@example.com",
+                    "first_name": "One",
+                    "last_name": "Student",
                     "intra_login": "one",
+                    "intra_user_id": "",
                     "github_username": "one-gh",
                     "repo_name": "team-01",
                     "permission": "push",
@@ -154,7 +242,10 @@ class ProvisioningTest(unittest.TestCase):
                 },
                 {
                     "email": "two@example.com",
+                    "first_name": "Two",
+                    "last_name": "Student",
                     "intra_login": "two",
+                    "intra_user_id": "",
                     "github_username": "two-gh",
                     "repo_name": "team-01",
                     "permission": "push",
@@ -169,8 +260,8 @@ class ProvisioningTest(unittest.TestCase):
 
         self.assertEqual(
             template,
-            "email,intra_login,github_username,repo_name,permission,repo_type\n"
-            "student@example.com,jdoe,github-user,,push,individual\n",
+            "email,first_name,last_name\n"
+            "student@example.com,John,Doe\n",
         )
 
     def test_effective_permission_returns_highest_true_permission(self):

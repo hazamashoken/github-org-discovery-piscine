@@ -3,11 +3,8 @@ import re
 
 CSV_TEMPLATE_COLUMNS = [
     "email",
-    "intra_login",
-    "github_username",
-    "repo_name",
-    "permission",
-    "repo_type",
+    "first_name",
+    "last_name",
 ]
 
 PERMISSION_PRIORITY = ["admin", "maintain", "push", "triage", "pull"]
@@ -42,6 +39,9 @@ def build_manual_row(
     email,
     intra_login,
     github_username="",
+    intra_user_id="",
+    first_name="",
+    last_name="",
     repo_name="",
     permission="push",
     course_run="",
@@ -49,13 +49,18 @@ def build_manual_row(
 ):
     email = clean_text(email)
     intra_login = clean_text(intra_login)
-    repo_name = clean_text(repo_name) or build_repo_name(course_run, intra_login)
+    repo_name = clean_text(repo_name)
+    if not repo_name and intra_login:
+        repo_name = build_repo_name(course_run, intra_login)
     permission = clean_text(permission) or "push"
     repo_type = clean_text(repo_type) or "individual"
 
     return {
         "email": email,
+        "first_name": clean_text(first_name),
+        "last_name": clean_text(last_name),
         "intra_login": intra_login,
+        "intra_user_id": clean_text(intra_user_id),
         "github_username": clean_text(github_username),
         "repo_name": repo_name,
         "permission": permission,
@@ -76,8 +81,6 @@ def validate_roster(roster, course_run=""):
 
         if not email:
             raise ValueError(f"Row {index}: missing email")
-        if not intra_login:
-            raise ValueError(f"Row {index}: missing intra_login")
         if permission not in ALLOWED_PERMISSIONS:
             raise ValueError(f"Row {index}: invalid permission '{permission}'")
         if repo_type not in ALLOWED_REPO_TYPES:
@@ -86,7 +89,10 @@ def validate_roster(roster, course_run=""):
         normalized.append(
             build_manual_row(
                 email=email,
+                first_name=row.get("first_name", ""),
+                last_name=row.get("last_name", ""),
                 intra_login=intra_login,
+                intra_user_id=row.get("intra_user_id", ""),
                 github_username=row.get("github_username", ""),
                 repo_name=row.get("repo_name", ""),
                 permission=permission,
@@ -109,6 +115,48 @@ def validate_roster(roster, course_run=""):
         individual_repo_names[repo_name] = index
 
     return normalized
+
+
+def prepare_individual_repo_rows(roster, course_run=""):
+    prepared = []
+
+    for index, row in enumerate(roster, start=1):
+        repo_name = clean_text(row.get("repo_name"))
+        intra_login = clean_text(row.get("intra_login"))
+
+        if not repo_name and intra_login:
+            repo_name = build_repo_name(course_run, intra_login)
+        if not repo_name:
+            raise ValueError(f"Row {index}: missing repo_name when intra_login is blank")
+
+        prepared.append({**row, "repo_name": repo_name, "intra_login": intra_login})
+
+    return prepared
+
+
+def prepare_intra_user_rows(roster, course_run=""):
+    prepared = []
+
+    for row in roster:
+        intra_login = clean_text(row.get("intra_login"))
+        repo_name = clean_text(row.get("repo_name"))
+
+        if not repo_name and intra_login:
+            repo_name = build_repo_name(course_run, intra_login)
+
+        prepared.append(
+            {
+                **row,
+                "intra_login": intra_login,
+                "intra_user_id": clean_text(row.get("intra_user_id")),
+                "github_username": clean_text(row.get("github_username")),
+                "repo_name": repo_name,
+                "permission": clean_text(row.get("permission")) or "push",
+                "repo_type": clean_text(row.get("repo_type")) or "individual",
+            }
+        )
+
+    return prepared
 
 
 def roster_topics(course_run):
@@ -144,7 +192,10 @@ def build_group_project_rows(roster_rows, repo_name, permission="push"):
     return [
         build_manual_row(
             email=row.get("email", ""),
+            first_name=row.get("first_name", ""),
+            last_name=row.get("last_name", ""),
             intra_login=row.get("intra_login", ""),
+            intra_user_id=row.get("intra_user_id", ""),
             github_username=row.get("github_username", ""),
             repo_name=repo_name,
             permission=permission,
@@ -164,7 +215,7 @@ def csv_template():
     return (
         ",".join(CSV_TEMPLATE_COLUMNS)
         + "\n"
-        + "student@example.com,jdoe,github-user,,push,individual\n"
+        + "student@example.com,John,Doe\n"
     )
 
 

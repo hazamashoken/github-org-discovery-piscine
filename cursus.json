@@ -1,0 +1,22 @@
+[
+  {
+    "cursus_id": 80,
+    "cursus_title": "Discovery Piscine - Core Python Programming"
+  },
+  {
+    "cursus_id": 3,
+    "cursus_title": "Discovery Piscine - Web Programming Essentials"
+  },
+  {
+    "cursus_id": 68,
+    "cursus_title": "Discovery Piscine - Cybersecurity"
+  },
+  {
+    "cursus_id": 74,
+    "cursus_title": "Pro Piscine - Web Application Security Fundamentals"
+  },
+  {
+    "cursus_id": 75,
+    "cursus_title": "Pro Piscine - AI / Machine Learning using advanced libraires"
+  }
+]
