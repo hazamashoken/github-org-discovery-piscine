@@ -147,3 +147,141 @@ def create_intra_user(access_token, payload):
         "status_code": response.status_code,
         "message": response.text,
     }
+
+
+def simplify_cursus_user(cursus_user):
+    user = cursus_user.get("user") or {}
+    cursus = cursus_user.get("cursus") or {}
+    campus = cursus_user.get("campus") or {}
+
+    return {
+        "cursus_user_id": clean_text(cursus_user.get("id")),
+        "user_id": clean_text(user.get("id")),
+        "login": clean_text(user.get("login")),
+        "email": clean_text(user.get("email")),
+        "first_name": clean_text(user.get("first_name")),
+        "last_name": clean_text(user.get("last_name")),
+        "cursus_id": clean_text(cursus.get("id") or cursus_user.get("cursus_id")),
+        "cursus_name": clean_text(cursus.get("name")),
+        "campus_id": clean_text(campus.get("id") or cursus_user.get("campus_id")),
+        "begin_at": clean_text(cursus_user.get("begin_at")),
+        "end_at": clean_text(cursus_user.get("end_at")),
+        "created_at": clean_text(cursus_user.get("created_at")),
+    }
+
+
+def list_cursus_users(
+    access_token,
+    cursus_id,
+    campus_id="64",
+    active_only=True,
+    begin_at_range=None,
+):
+    rows = []
+    page = 1
+
+    while True:
+        params = {
+            "filter[campus_id]": clean_text(campus_id),
+            "per_page": 100,
+            "page": page,
+        }
+        if active_only:
+            params["filter[end]"] = "false"
+        if begin_at_range:
+            start_at, end_at = begin_at_range
+            params["range[begin_at]"] = f"{clean_text(start_at)},{clean_text(end_at)}"
+
+        response = requests.get(
+            f"{INTRA_API_BASE}/v2/cursus/{int(cursus_id)}/cursus_users",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            params=params,
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            return False, {
+                "status_code": response.status_code,
+                "message": response.text,
+            }
+
+        data = response.json()
+        if not data:
+            return True, rows
+
+        rows.extend(simplify_cursus_user(item) for item in data)
+        page += 1
+
+
+def simplify_project_user(project_user):
+    project = project_user.get("project") or {}
+    teams = project_user.get("teams") or []
+    current_team = next(
+        (
+            team
+            for team in teams
+            if clean_text(team.get("id")) == clean_text(project_user.get("current_team_id"))
+        ),
+        teams[0] if teams else {},
+    )
+
+    return {
+        "projects_user_id": clean_text(project_user.get("id")),
+        "project_id": clean_text(project.get("id") or project_user.get("project_id")),
+        "project_name": clean_text(project.get("name")),
+        "project_slug": clean_text(project.get("slug")),
+        "status": clean_text(project_user.get("status")),
+        "final_mark": clean_text(project_user.get("final_mark")),
+        "validated": clean_text(project_user.get("validated?")),
+        "marked_at": clean_text(project_user.get("marked_at")),
+        "updated_at": clean_text(project_user.get("updated_at")),
+        "team_id": clean_text(current_team.get("id")),
+        "team_name": clean_text(current_team.get("name")),
+        "team_status": clean_text(current_team.get("status")),
+        "team_final_mark": clean_text(current_team.get("final_mark")),
+        "team_validated": clean_text(current_team.get("validated?")),
+        "team_closed": clean_text(current_team.get("closed?")),
+        "team_closed_at": clean_text(current_team.get("closed_at")),
+        "team_repo_url": clean_text(current_team.get("repo_url")),
+    }
+
+
+def list_user_project_users(access_token, user_id, cursus_id="", campus_id=""):
+    rows = []
+    page = 1
+
+    while True:
+        params = {
+            "page[size]": 100,
+            "page[number]": page,
+        }
+        if clean_text(cursus_id):
+            params["filter[cursus]"] = clean_text(cursus_id)
+        if clean_text(campus_id):
+            params["filter[campus]"] = clean_text(campus_id)
+
+        response = requests.get(
+            f"{INTRA_API_BASE}/v2/users/{clean_text(user_id)}/projects_users",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            params=params,
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            return False, {
+                "status_code": response.status_code,
+                "message": response.text,
+            }
+
+        data = response.json()
+        if not data:
+            return True, rows
+
+        rows.extend(simplify_project_user(item) for item in data)
+        page += 1

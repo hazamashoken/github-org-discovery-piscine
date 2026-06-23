@@ -1,3 +1,5 @@
+import csv
+import io
 import re
 
 
@@ -106,6 +108,8 @@ def validate_roster(roster, course_run=""):
         if row["repo_type"] != "individual":
             continue
         repo_name = row["repo_name"]
+        if not repo_name:
+            continue
         if repo_name in individual_repo_names:
             first_index = individual_repo_names[repo_name]
             raise ValueError(
@@ -217,6 +221,26 @@ def csv_template():
         + "\n"
         + "student@example.com,John,Doe\n"
     )
+
+
+def read_roster_csv(file_like):
+    if hasattr(file_like, "getvalue"):
+        raw_data = file_like.getvalue()
+    else:
+        raw_data = file_like.read()
+
+    if isinstance(raw_data, str):
+        raw_data = raw_data.encode("utf-8")
+
+    last_error = None
+    for encoding in ["utf-8-sig", "utf-8", "cp1252", "latin1"]:
+        try:
+            decoded = raw_data.decode(encoding)
+            return list(csv.DictReader(io.StringIO(decoded)))
+        except UnicodeDecodeError as exc:
+            last_error = exc
+
+    raise ValueError(f"Could not decode roster CSV: {last_error}")
 
 
 def effective_permission(permissions):

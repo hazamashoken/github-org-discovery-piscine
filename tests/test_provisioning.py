@@ -1,3 +1,4 @@
+import io
 import unittest
 
 from provisioning import (
@@ -9,6 +10,7 @@ from provisioning import (
     normalize_topic,
     prepare_intra_user_rows,
     prepare_individual_repo_rows,
+    read_roster_csv,
     roster_topics,
     select_roster_rows,
     unique_repo_rows,
@@ -76,6 +78,34 @@ class ProvisioningTest(unittest.TestCase):
 
         self.assertEqual(roster[0]["intra_login"], "")
         self.assertEqual(roster[0]["repo_name"], "")
+
+    def test_validate_roster_allows_multiple_identity_only_rows(self):
+        roster = validate_roster(
+            [
+                {
+                    "email": "one@example.com",
+                    "first_name": "One",
+                    "last_name": "Student",
+                },
+                {
+                    "email": "two@example.com",
+                    "first_name": "Two",
+                    "last_name": "Student",
+                },
+            ],
+            course_run="Discovery 2026",
+        )
+
+        self.assertEqual([row["repo_name"] for row in roster], ["", ""])
+
+    def test_read_roster_csv_handles_cp1252_non_breaking_space(self):
+        csv_file = io.BytesIO(
+            b"email,first_name,last_name\nstudent@example.com,John,Doe\xa0\n"
+        )
+
+        roster = validate_roster(read_roster_csv(csv_file), course_run="Discovery 2026")
+
+        self.assertEqual(roster[0]["last_name"], "Doe")
 
     def test_prepare_individual_repo_rows_requires_intra_or_repo_name(self):
         with self.assertRaisesRegex(ValueError, "missing repo_name"):

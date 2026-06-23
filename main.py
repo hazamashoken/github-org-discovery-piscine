@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import datetime as dt
 
@@ -12,6 +13,8 @@ from intra import (
     format_intra_datetime,
     format_singapore_display,
     get_intra_access_token,
+    list_cursus_users,
+    list_user_project_users,
     load_cursus_options,
     now_singapore,
 )
@@ -24,6 +27,7 @@ from provisioning import (
     normalize_topic,
     prepare_intra_user_rows,
     prepare_individual_repo_rows,
+    read_roster_csv,
     roster_topics,
     select_roster_rows,
     unique_repo_rows,
@@ -160,6 +164,113 @@ def list_repo_collaborators(repo_name):
 
         collaborators.extend(data)
         page += 1
+
+
+def get_latest_repo_commit(repo_name):
+    url = f"{API_BASE}/repos/{GITHUB_ORG}/{repo_name}/commits"
+    ok, data = github_request("GET", url, params={"per_page": 1})
+    if not ok:
+        return ok, data
+    if not data:
+        return True, {}
+    return True, data[0]
+
+
+def github_error_message(error):
+    if not error:
+        return ""
+    if isinstance(error, dict):
+        status_code = error.get("status_code")
+        message = str(error.get("message", ""))
+        if status_code == 403 and "Resource not accessible by personal access token" in message:
+            return "GitHub token needs Contents: read permission to read commits for this repo"
+        if status_code:
+            return f"GitHub API {status_code}: {message}"
+        return str(error)
+    return str(error)
+
+
+def get_repo_commit_count(repo_name):
+    url = f"{API_BASE}/repos/{GITHUB_ORG}/{repo_name}/commits"
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        params={"per_page": 1},
+        timeout=30,
+    )
+    if response.status_code not in [200, 201, 202, 204]:
+        return False, {
+            "status_code": response.status_code,
+            "message": response.text,
+        }
+
+    data = response.json()
+    if not data:
+        return True, 0
+
+    link_header = response.headers.get("Link", "")
+    if 'rel="last"' not in link_header:
+        return True, len(data)
+
+    for part in link_header.split(","):
+        if 'rel="last"' not in part:
+            continue
+        marker = "page="
+        if marker not in part:
+            continue
+        page_text = part.split(marker, 1)[1].split(">", 1)[0].split("&", 1)[0]
+        try:
+            return True, int(page_text)
+        except ValueError:
+            break
+
+    return True, len(data)
+
+
+def get_repo_activity(repo_name):
+    repo_name = str(repo_name or "").strip()
+    if not repo_name:
+        return {
+            "github_repo_exists": False,
+            "github_error": "Missing repo_name",
+        }
+
+    ok, repo_or_error = github_request(
+        "GET",
+        f"{API_BASE}/repos/{GITHUB_ORG}/{repo_name}",
+    )
+    if not ok:
+        return {
+            "github_repo_exists": False,
+            "github_error": github_error_message(repo_or_error),
+        }
+
+    ok, commit_or_error = get_latest_repo_commit(repo_name)
+    latest_commit = commit_or_error if ok else {}
+    commit = latest_commit.get("commit") or {}
+    author = commit.get("author") or {}
+    commit_error = "" if ok else github_error_message(commit_or_error)
+
+    ok, count_or_error = get_repo_commit_count(repo_name)
+    commit_count = count_or_error if ok else ""
+    if not ok and not commit_error:
+        commit_error = github_error_message(count_or_error)
+
+    return {
+        "github_repo_exists": True,
+        "repo_html_url": repo_or_error.get("html_url", ""),
+        "repo_private": repo_or_error.get("private", ""),
+        "repo_default_branch": repo_or_error.get("default_branch", ""),
+        "repo_pushed_at": repo_or_error.get("pushed_at", ""),
+        "repo_updated_at": repo_or_error.get("updated_at", ""),
+        "repo_open_issues": repo_or_error.get("open_issues_count", ""),
+        "repo_size": repo_or_error.get("size", ""),
+        "repo_commit_count": commit_count,
+        "latest_commit_sha": latest_commit.get("sha", ""),
+        "latest_commit_at": author.get("date", ""),
+        "latest_commit_message": commit.get("message", ""),
+        "github_error": commit_error,
+    }
 
 
 def list_collaborators_for_repos(repos):
@@ -363,6 +474,245 @@ def create_intra_users(roster, campus_id, cursus, begin_at, end_at, course_run):
         update_roster_rows(DEFAULT_DB_PATH, updated_rows)
 
     return results, ""
+
+
+def fetch_cursus_users(cursus_id, campus_id, active_only):
+    ok, token_or_error = get_intra_access_token(st.secrets)
+    if not ok:
+        return ok, token_or_error
+
+    return list_cursus_users(
+        access_token=token_or_error,
+        cursus_id=cursus_id,
+        campus_id=campus_id,
+        active_only=active_only,
+    )
+
+
+def fetch_cursus_users_by_begin_at(cursus_id, campus_id, start_at, end_at, active_only):
+    ok, token_or_error = get_intra_access_token(st.secrets)
+    if not ok:
+        return ok, token_or_error
+
+    return list_cursus_users(
+        access_token=token_or_error,
+        cursus_id=cursus_id,
+        campus_id=campus_id,
+        active_only=active_only,
+        begin_at_range=(start_at, end_at),
+    )
+
+
+def cursus_user_stats(rows):
+    return {
+        "active_users": len(rows),
+        "with_login": sum(1 for row in rows if row.get("login")),
+        "with_email": sum(1 for row in rows if row.get("email")),
+        "unique_campus_ids": len({row.get("campus_id") for row in rows if row.get("campus_id")}),
+    }
+
+
+def fetch_student_intra_projects(student, cursus_id, campus_id, access_token=None):
+    intra_user = student.get("intra_user_id") or student.get("intra_login")
+    if not intra_user:
+        return True, []
+
+    if access_token is None:
+        ok, token_or_error = get_intra_access_token(st.secrets)
+        if not ok:
+            return ok, token_or_error
+        access_token = token_or_error
+
+    return list_user_project_users(
+        access_token=access_token,
+        user_id=intra_user,
+        cursus_id=cursus_id,
+        campus_id=campus_id,
+    )
+
+
+def student_display_name(student):
+    name = " ".join(
+        value
+        for value in [student.get("first_name", ""), student.get("last_name", "")]
+        if value
+    )
+    return name or student.get("email", "")
+
+
+def project_overview_row(student, github_activity, intra_projects):
+    project_count = len(intra_projects)
+    finished_count = sum(1 for project in intra_projects if project.get("status") == "finished")
+    validated_count = sum(1 for project in intra_projects if project.get("validated") == "True")
+    in_progress = [
+        project["project_name"]
+        for project in intra_projects
+        if project.get("status") in {"in_progress", "creating_group", "waiting_for_correction"}
+    ]
+
+    return {
+        "student": student_display_name(student),
+        "email": student.get("email", ""),
+        "intra_login": student.get("intra_login", ""),
+        "github_username": student.get("github_username", ""),
+        "repo_name": student.get("repo_name", ""),
+        "repo_exists": github_activity.get("github_repo_exists", False),
+        "repo_commit_count": github_activity.get("repo_commit_count", ""),
+        "repo_pushed_at": github_activity.get("repo_pushed_at", ""),
+        "latest_commit_at": github_activity.get("latest_commit_at", ""),
+        "latest_commit_sha": github_activity.get("latest_commit_sha", ""),
+        "intra_projects": project_count,
+        "finished_projects": finished_count,
+        "validated_projects": validated_count,
+        "current_projects": ", ".join(in_progress),
+        "github_error": github_activity.get("github_error", ""),
+    }
+
+
+def fetch_student_project_status(student, cursus_id, campus_id, intra_access_token=None):
+    github_activity = get_repo_activity(student.get("repo_name"))
+    ok, intra_projects_or_error = fetch_student_intra_projects(
+        student=student,
+        cursus_id=cursus_id,
+        campus_id=campus_id,
+        access_token=intra_access_token,
+    )
+    if not ok:
+        intra_projects = []
+        intra_error = intra_projects_or_error
+    else:
+        intra_projects = intra_projects_or_error
+        intra_error = ""
+
+    return {
+        "overview": project_overview_row(student, github_activity, intra_projects),
+        "github": github_activity,
+        "intra_projects": intra_projects,
+        "intra_error": intra_error,
+    }
+
+
+def fetch_project_statuses_parallel(roster, cursus_id, campus_id, progress):
+    ok, token_or_error = get_intra_access_token(st.secrets)
+    if not ok:
+        return False, token_or_error, {}
+
+    max_workers = min(8, max(1, len(roster)))
+    completed = 0
+    statuses_by_index = {}
+    detail_by_email = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                fetch_student_project_status,
+                student,
+                cursus_id,
+                campus_id,
+                token_or_error,
+            ): (index, student)
+            for index, student in enumerate(roster)
+        }
+
+        for future in as_completed(futures):
+            index, student = futures[future]
+            try:
+                status = future.result()
+            except Exception as exc:
+                github_activity = {
+                    "github_repo_exists": False,
+                    "github_error": str(exc),
+                }
+                status = {
+                    "overview": project_overview_row(student, github_activity, []),
+                    "github": github_activity,
+                    "intra_projects": [],
+                    "intra_error": str(exc),
+                }
+
+            statuses_by_index[index] = status
+            detail_by_email[student["email"]] = status
+            completed += 1
+            progress.progress(completed / len(roster))
+
+    overview_rows = [
+        statuses_by_index[index]["overview"]
+        for index in sorted(statuses_by_index)
+    ]
+    return True, overview_rows, detail_by_email
+
+
+def is_true_value(value):
+    return str(value).strip().lower() == "true"
+
+
+def project_progress_value(project):
+    if is_true_value(project.get("validated")):
+        return 100
+    status = project.get("status", "")
+    if status == "finished":
+        return 80
+    if status in {"waiting_for_correction", "in_progress"}:
+        return 60
+    if status == "creating_group":
+        return 30
+    return 10 if status else 0
+
+
+def project_chart_rows(detail_by_email):
+    projects = {}
+
+    for status in detail_by_email.values():
+        for project in status.get("intra_projects", []):
+            project_name = project.get("project_name") or project.get("project_slug")
+            if not project_name:
+                continue
+            row = projects.setdefault(
+                project_name,
+                {
+                    "project": project_name,
+                    "completed": 0,
+                    "doing": 0,
+                    "attempted": 0,
+                },
+            )
+            row["attempted"] += 1
+            if is_true_value(project.get("validated")):
+                row["completed"] += 1
+            elif project.get("status") in {
+                "creating_group",
+                "in_progress",
+                "waiting_for_correction",
+            }:
+                row["doing"] += 1
+
+    return sorted(
+        projects.values(),
+        key=lambda row: (row["completed"], row["doing"], row["attempted"], row["project"]),
+        reverse=True,
+    )
+
+
+def student_chart_rows(overview_rows):
+    rows = []
+    for row in overview_rows:
+        doing_count = len(
+            [
+                project
+                for project in row.get("current_projects", "").split(", ")
+                if project
+            ]
+        )
+        rows.append(
+            {
+                "student": row["student"],
+                "validated": row["validated_projects"],
+                "finished": row["finished_projects"],
+                "doing": doing_count,
+                "commits": row.get("repo_commit_count") or 0,
+            }
+        )
+    return rows
 
 
 def update_repo_collaborators(repos, github_username, permission):
@@ -714,10 +1064,24 @@ st.caption(
 )
 st.caption(f"Local DB: `{DEFAULT_DB_PATH}`")
 
-tab_roster, tab_intra, tab_individual, tab_group, tab_collab, tab_permission, tab_manage = st.tabs(
+(
+    tab_roster,
+    tab_intra,
+    tab_cursus_users,
+    tab_statistics,
+    tab_project_status,
+    tab_individual,
+    tab_group,
+    tab_collab,
+    tab_permission,
+    tab_manage,
+) = st.tabs(
     [
         "Roster",
         "Intra users",
+        "Cursus users",
+        "Statistics",
+        "Project status",
         "Individual repos",
         "Group project",
         "Add collaborators",
@@ -741,7 +1105,7 @@ with tab_roster:
         uploaded_roster = []
         if uploaded_file:
             try:
-                uploaded_df = pd.read_csv(uploaded_file)
+                uploaded_df = read_roster_csv(uploaded_file)
                 uploaded_roster = validate_roster(uploaded_df, course_run=course_run)
                 st.dataframe(pd.DataFrame(uploaded_roster), width="stretch")
                 if st.button("Save uploaded roster"):
@@ -876,6 +1240,349 @@ with tab_intra:
         else:
             show_result_table("Intra user creation result", results, "intra_user_creation_result.csv")
             st.session_state.current_roster = list_roster_rows(DEFAULT_DB_PATH, course_run)
+
+with tab_cursus_users:
+    st.subheader("Fetch cursus users")
+    st.write("Fetch active Intra users for a cursus and campus. Defaults to campus 64 and active cursus users.")
+
+    cursus_options = load_cursus_options()
+    if cursus_options:
+        selected_fetch_cursus = st.selectbox(
+            "Cursus",
+            cursus_options,
+            format_func=lambda item: f"{item['cursus_title']} ({item['cursus_id']})",
+            key="fetch_cursus_users_cursus",
+        )
+        fetch_cursus_id = selected_fetch_cursus["cursus_id"]
+    else:
+        selected_fetch_cursus = None
+        fetch_cursus_id = st.number_input(
+            "Cursus ID",
+            min_value=1,
+            value=80,
+            step=1,
+            key="fetch_cursus_users_manual_cursus_id",
+        )
+        st.warning("No cursus options found in cursus.json")
+
+    fetch_campus_id = st.text_input(
+        "Campus ID",
+        value=st.secrets.get("INTRA_CAMPUS_ID", "64"),
+        key="fetch_cursus_users_campus_id",
+    )
+    fetch_active_only = st.checkbox(
+        "Only users without an end date",
+        value=True,
+        key="fetch_cursus_users_active_only",
+    )
+
+    if st.button("Fetch cursus users", disabled=not fetch_cursus_id or not fetch_campus_id):
+        ok, data = fetch_cursus_users(
+            cursus_id=fetch_cursus_id,
+            campus_id=fetch_campus_id,
+            active_only=fetch_active_only,
+        )
+        if ok:
+            st.session_state.cursus_users = data
+            st.success(f"Fetched {len(data)} cursus users")
+        else:
+            st.error(f"Fetch cursus users failed: {data}")
+
+    cursus_users = st.session_state.get("cursus_users", [])
+    if cursus_users:
+        show_result_table(
+            "Cursus users",
+            cursus_users,
+            f"cursus_{fetch_cursus_id}_campus_{fetch_campus_id}_users.csv",
+        )
+    else:
+        st.info("Fetch cursus users to view them here.")
+
+with tab_statistics:
+    st.subheader("Intra user statistics")
+    st.write("Fetch active users whose cursus begin_at is within a date range for the selected cursus.")
+
+    cursus_options = load_cursus_options()
+    if cursus_options:
+        selected_stats_cursus = st.selectbox(
+            "Cursus",
+            cursus_options,
+            format_func=lambda item: f"{item['cursus_title']} ({item['cursus_id']})",
+            key="stats_cursus",
+        )
+        stats_cursus_id = selected_stats_cursus["cursus_id"]
+    else:
+        stats_cursus_id = st.number_input(
+            "Cursus ID",
+            min_value=1,
+            value=80,
+            step=1,
+            key="stats_manual_cursus_id",
+        )
+        st.warning("No cursus options found in cursus.json")
+
+    stats_campus_id = st.text_input(
+        "Campus ID",
+        value=st.secrets.get("INTRA_CAMPUS_ID", "64"),
+        key="stats_campus_id",
+    )
+    stats_active_only = st.checkbox(
+        "Only users without an end date",
+        value=True,
+        key="stats_active_only",
+    )
+
+    fallback_stats_start = now_singapore().replace(second=0, microsecond=0)
+    fallback_stats_end = fallback_stats_start + dt.timedelta(days=30)
+    course_stats_start = parse_stored_datetime(
+        selected_course_run["start_at"],
+        fallback_stats_start,
+    )
+    course_stats_end = parse_stored_datetime(
+        selected_course_run["end_at"],
+        fallback_stats_end,
+    )
+    use_course_stats_range = st.checkbox(
+        "Use course run start/end datetime",
+        value=True,
+        key="stats_use_course_datetime",
+    )
+
+    if use_course_stats_range:
+        stats_start_date = course_stats_start.date()
+        stats_start_time = course_stats_start.time()
+        stats_end_date = course_stats_end.date()
+        stats_end_time = course_stats_end.time()
+        st.text_input(
+            "Begin at start",
+            value=format_intra_datetime(stats_start_date, stats_start_time),
+            disabled=True,
+            key="stats_begin_start_display",
+        )
+        st.text_input(
+            "Begin at end",
+            value=format_intra_datetime(stats_end_date, stats_end_time),
+            disabled=True,
+            key="stats_begin_end_display",
+        )
+    else:
+        stats_start_date = st.date_input(
+            "Begin at start date (Asia/Singapore)",
+            value=course_stats_start.date(),
+            key="stats_start_date",
+        )
+        stats_start_time = st.time_input(
+            "Begin at start time (Asia/Singapore)",
+            value=course_stats_start.time(),
+            key="stats_start_time",
+        )
+        stats_end_date = st.date_input(
+            "Begin at end date (Asia/Singapore)",
+            value=course_stats_end.date(),
+            key="stats_end_date",
+        )
+        stats_end_time = st.time_input(
+            "Begin at end time (Asia/Singapore)",
+            value=course_stats_end.time(),
+            key="stats_end_time",
+        )
+
+    stats_start_at = format_intra_datetime(stats_start_date, stats_start_time)
+    stats_end_at = format_intra_datetime(stats_end_date, stats_end_time)
+    stats_fetch_label = (
+        "Fetch active users for statistics"
+        if stats_active_only
+        else "Fetch users for statistics"
+    )
+
+    if st.button(
+        stats_fetch_label,
+        disabled=not stats_cursus_id or not stats_campus_id,
+    ):
+        ok, data = fetch_cursus_users_by_begin_at(
+            cursus_id=stats_cursus_id,
+            campus_id=stats_campus_id,
+            start_at=stats_start_at,
+            end_at=stats_end_at,
+            active_only=stats_active_only,
+        )
+        if ok:
+            st.session_state.statistics_cursus_users = data
+            fetched_label = "active users" if stats_active_only else "users"
+            st.success(f"Fetched {len(data)} {fetched_label}")
+        else:
+            st.error(f"Fetch statistics failed: {data}")
+
+    statistics_rows = st.session_state.get("statistics_cursus_users", [])
+    if statistics_rows:
+        stats = cursus_user_stats(statistics_rows)
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Active users", stats["active_users"])
+        metric_cols[1].metric("With login", stats["with_login"])
+        metric_cols[2].metric("With email", stats["with_email"])
+        metric_cols[3].metric("Campuses", stats["unique_campus_ids"])
+        show_result_table(
+            "Active users",
+            statistics_rows,
+            f"active_cursus_{stats_cursus_id}_campus_{stats_campus_id}_users.csv",
+        )
+    else:
+        st.info("Fetch active users to view statistics here.")
+
+with tab_project_status:
+    roster = st.session_state.get("current_roster", [])
+    st.subheader("Project status")
+    st.write("Fetch GitHub repository activity and 42 Intra project progress for students in the selected roster.")
+
+    cursus_options = load_cursus_options()
+    if cursus_options:
+        selected_project_cursus = st.selectbox(
+            "Cursus",
+            cursus_options,
+            format_func=lambda item: f"{item['cursus_title']} ({item['cursus_id']})",
+            key="project_status_cursus",
+        )
+        project_cursus_id = selected_project_cursus["cursus_id"]
+    else:
+        project_cursus_id = st.number_input(
+            "Cursus ID",
+            min_value=1,
+            value=80,
+            step=1,
+            key="project_status_manual_cursus_id",
+        )
+        st.warning("No cursus options found in cursus.json")
+
+    project_campus_id = st.text_input(
+        "Campus ID",
+        value=st.secrets.get("INTRA_CAMPUS_ID", "64"),
+        key="project_status_campus_id",
+    )
+
+    if not roster:
+        st.info("Build a roster first.")
+    else:
+        st.caption(f"{len(roster)} roster students")
+        if st.button(
+            "Refresh project overview",
+            disabled=not project_cursus_id or not project_campus_id,
+        ):
+            progress = st.progress(0)
+            ok, overview_rows_or_error, detail_by_email = fetch_project_statuses_parallel(
+                roster=roster,
+                cursus_id=project_cursus_id,
+                campus_id=project_campus_id,
+                progress=progress,
+            )
+            if ok:
+                st.session_state.project_status_overview = overview_rows_or_error
+                st.session_state.project_status_detail_by_email = detail_by_email
+                st.success(f"Fetched project status for {len(overview_rows_or_error)} students")
+            else:
+                st.error(overview_rows_or_error)
+
+        overview_rows = st.session_state.get("project_status_overview", [])
+        if overview_rows:
+            detail_by_email = st.session_state.get("project_status_detail_by_email", {})
+            stats_cols = st.columns(4)
+            stats_cols[0].metric("Students", len(overview_rows))
+            stats_cols[1].metric(
+                "Repos found",
+                sum(1 for row in overview_rows if row["repo_exists"]),
+            )
+            stats_cols[2].metric(
+                "With Intra projects",
+                sum(1 for row in overview_rows if row["intra_projects"]),
+            )
+            stats_cols[3].metric(
+                "Validated projects",
+                sum(row["validated_projects"] for row in overview_rows),
+            )
+
+            project_rows = project_chart_rows(detail_by_email)
+            student_rows = student_chart_rows(overview_rows)
+
+            if project_rows:
+                st.subheader("Project completion")
+                project_chart_df = pd.DataFrame(project_rows).set_index("project")
+                st.bar_chart(
+                    project_chart_df[["completed", "doing", "attempted"]],
+                    width="stretch",
+                )
+            else:
+                st.info("No Intra project data available for project charts.")
+
+            if student_rows:
+                st.subheader("Student progress")
+                student_chart_df = pd.DataFrame(student_rows).set_index("student")
+                st.bar_chart(
+                    student_chart_df[["validated", "finished", "doing"]],
+                    width="stretch",
+                )
+
+            overview_df = pd.DataFrame(overview_rows)
+            st.download_button(
+                label="Download project overview CSV",
+                data=overview_df.to_csv(index=False),
+                file_name=f"{course_run}_project_overview.csv",
+                mime="text/csv",
+            )
+
+        st.divider()
+        st.subheader("Individual student")
+        selected_student = st.selectbox(
+            "Student",
+            roster,
+            format_func=lambda row: (
+                f"{student_display_name(row)} | "
+                f"{row.get('intra_login') or 'no intra'} | "
+                f"{row.get('repo_name') or 'no repo'}"
+            ),
+            key="project_status_student",
+        )
+
+        if st.button(
+            "Load selected student progress",
+            disabled=not project_cursus_id or not project_campus_id,
+        ):
+            status = fetch_student_project_status(
+                student=selected_student,
+                cursus_id=project_cursus_id,
+                campus_id=project_campus_id,
+            )
+            st.session_state.selected_project_status = status
+
+        selected_status = st.session_state.get("selected_project_status")
+        if selected_status:
+            overview = selected_status["overview"]
+            github = selected_status["github"]
+            student_cols = st.columns(4)
+            student_cols[0].metric("Repo", "Found" if overview["repo_exists"] else "Missing")
+            student_cols[1].metric("Commits", overview.get("repo_commit_count") or 0)
+            student_cols[2].metric("Validated", overview["validated_projects"])
+            student_cols[3].metric("Doing", len([p for p in overview["current_projects"].split(", ") if p]))
+
+            repo_url = github.get("repo_html_url")
+            if repo_url:
+                st.link_button("Open GitHub repo", repo_url)
+            if github.get("github_error"):
+                st.warning(github["github_error"])
+
+            st.subheader("Project progress")
+            if selected_status["intra_error"]:
+                st.error(selected_status["intra_error"])
+            elif selected_status["intra_projects"]:
+                for project in selected_status["intra_projects"]:
+                    project_name = project.get("project_name") or project.get("project_slug") or "Unnamed project"
+                    status_text = project.get("status") or "unknown"
+                    mark_text = project.get("final_mark") or "-"
+                    validated_text = "validated" if is_true_value(project.get("validated")) else "not validated"
+                    st.progress(
+                        project_progress_value(project),
+                        text=f"{project_name} | {status_text} | mark {mark_text} | {validated_text}",
+                    )
+            else:
+                st.info("No Intra project rows found for this student.")
 
 with tab_individual:
     roster = st.session_state.get("current_roster", [])
