@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -122,6 +123,17 @@ def init_db(db_path=DEFAULT_DB_PATH):
                 "ALTER TABLE roster_entries "
                 "ADD COLUMN intra_user_id TEXT NOT NULL DEFAULT ''"
             )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS project_status_cache (
+                course_run TEXT NOT NULL,
+                email TEXT NOT NULL,
+                status_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(course_run, email)
+            )
+            """
+        )
         table_info = connection.execute("PRAGMA table_info(roster_entries)").fetchall()
         intra_login_column = next(row for row in table_info if row["name"] == "intra_login")
         if (
@@ -441,3 +453,49 @@ def update_roster_rows(db_path, rows):
         connection.close()
 
     return len(rows)
+
+
+def save_project_status_cache(db_path, course_run, email, status):
+    connection = connect(db_path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO project_status_cache (
+                course_run,
+                email,
+                status_json,
+                updated_at
+            )
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(course_run, email)
+            DO UPDATE SET
+                status_json = excluded.status_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (course_run, email, json.dumps(status)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def get_project_status_cache(db_path, course_run, email):
+    connection = connect(db_path)
+    try:
+        row = connection.execute(
+            """
+            SELECT status_json, updated_at
+            FROM project_status_cache
+            WHERE course_run = ? AND email = ?
+            """,
+            (course_run, email),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    if not row:
+        return None
+
+    status = json.loads(row["status_json"])
+    status["cache_updated_at"] = row["updated_at"]
+    return status

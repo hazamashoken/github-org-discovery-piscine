@@ -248,3 +248,117 @@ def effective_permission(permissions):
         if permissions.get(permission):
             return permission
     return ""
+
+
+def is_true_value(value):
+    return str(value).strip().lower() == "true"
+
+
+def project_status_bucket(project):
+    if is_true_value(project.get("validated")):
+        return "completed"
+    if project.get("status") == "finished" or clean_text(project.get("final_mark")):
+        return "attempted"
+    if project.get("status") in {
+        "creating_group",
+        "in_progress",
+        "waiting_for_correction",
+    }:
+        return "doing"
+    return ""
+
+
+def project_chart_rows(detail_by_email):
+    project_user_buckets = {}
+    bucket_priority = {
+        "doing": 1,
+        "attempted": 2,
+        "completed": 3,
+    }
+
+    for user_key, status in detail_by_email.items():
+        for project in status.get("intra_projects", []):
+            project_name = project.get("project_name") or project.get("project_slug")
+            if not project_name:
+                continue
+            bucket = project_status_bucket(project)
+            if not bucket:
+                continue
+
+            project_buckets = project_user_buckets.setdefault(project_name, {})
+            current_bucket = project_buckets.get(user_key, "")
+            if bucket_priority[bucket] > bucket_priority.get(current_bucket, 0):
+                project_buckets[user_key] = bucket
+
+    projects = []
+    for project_name, user_buckets in project_user_buckets.items():
+        projects.append(
+            {
+                "project": project_name,
+                "completed": sum(1 for bucket in user_buckets.values() if bucket == "completed"),
+                "attempted": sum(1 for bucket in user_buckets.values() if bucket == "attempted"),
+                "doing": sum(1 for bucket in user_buckets.values() if bucket == "doing"),
+            }
+        )
+
+    return sorted(
+        projects,
+        key=lambda row: (row["completed"], row["attempted"], row["doing"], row["project"]),
+        reverse=True,
+    )
+
+
+def python_module_number(project):
+    project_name = clean_text(project.get("project_name") or project.get("project_slug"))
+    match = re.search(r"\bmodule[\s_-]*(\d+)\b", project_name, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    module_number = int(match.group(1))
+    if 0 <= module_number <= 9:
+        return module_number
+    return None
+
+
+def student_progress_rows(detail_by_email):
+    rows = []
+    bucket_priority = {
+        "in_progress": 1,
+        "waiting_for_correction": 2,
+        "finished": 3,
+    }
+
+    for status in detail_by_email.values():
+        overview = status.get("overview", {})
+        module_buckets = {}
+
+        for project in status.get("intra_projects", []):
+            module_number = python_module_number(project)
+            if module_number is None:
+                continue
+
+            if is_true_value(project.get("validated")):
+                bucket = "finished"
+            else:
+                bucket = project.get("status")
+            if bucket not in bucket_priority:
+                continue
+
+            current_bucket = module_buckets.get(module_number, "")
+            if bucket_priority[bucket] > bucket_priority.get(current_bucket, 0):
+                module_buckets[module_number] = bucket
+
+        rows.append(
+            {
+                "student": overview.get("student") or overview.get("email", ""),
+                "finished": sum(1 for bucket in module_buckets.values() if bucket == "finished"),
+                "waiting_for_correction": sum(
+                    1
+                    for bucket in module_buckets.values()
+                    if bucket == "waiting_for_correction"
+                ),
+                "in_progress": sum(1 for bucket in module_buckets.values() if bucket == "in_progress"),
+            }
+        )
+
+    return sorted(rows, key=lambda row: row["student"])

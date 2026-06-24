@@ -24,12 +24,15 @@ from provisioning import (
     build_manual_row,
     csv_template,
     effective_permission,
+    is_true_value,
     normalize_topic,
     prepare_intra_user_rows,
     prepare_individual_repo_rows,
+    project_chart_rows,
     read_roster_csv,
     roster_topics,
     select_roster_rows,
+    student_progress_rows,
     unique_repo_rows,
     validate_roster,
 )
@@ -39,9 +42,11 @@ from storage import (
     create_course_run,
     delete_course_run,
     delete_roster_rows,
+    get_project_status_cache,
     init_db,
     list_course_runs,
     list_roster_rows,
+    save_project_status_cache,
     save_roster_rows,
     update_roster_rows,
 )
@@ -182,6 +187,8 @@ def github_error_message(error):
     if isinstance(error, dict):
         status_code = error.get("status_code")
         message = str(error.get("message", ""))
+        if status_code in {403, 429} and "rate limit" in message.lower():
+            return f"GitHub API {status_code}: rate limit hit"
         if status_code == 403 and "Resource not accessible by personal access token" in message:
             return "GitHub token needs Contents: read permission to read commits for this repo"
         if status_code:
@@ -592,7 +599,7 @@ def fetch_student_project_status(student, cursus_id, campus_id, intra_access_tok
     }
 
 
-def fetch_project_statuses_parallel(roster, cursus_id, campus_id, progress):
+def fetch_project_statuses_parallel(roster, course_run, cursus_id, campus_id, progress):
     ok, token_or_error = get_intra_access_token(st.secrets)
     if not ok:
         return False, token_or_error, {}
@@ -630,6 +637,27 @@ def fetch_project_statuses_parallel(roster, cursus_id, campus_id, progress):
                     "intra_error": str(exc),
                 }
 
+            has_error = bool(
+                status.get("intra_error")
+                or status.get("github", {}).get("github_error")
+            )
+            if has_error:
+                cached_status = get_project_status_cache(
+                    DEFAULT_DB_PATH,
+                    course_run,
+                    student["email"],
+                )
+                if cached_status:
+                    status = cached_status
+                    status["cache_notice"] = "Using cached project status after fetch error"
+            else:
+                save_project_status_cache(
+                    DEFAULT_DB_PATH,
+                    course_run,
+                    student["email"],
+                    status,
+                )
+
             statuses_by_index[index] = status
             detail_by_email[student["email"]] = status
             completed += 1
@@ -640,10 +668,6 @@ def fetch_project_statuses_parallel(roster, cursus_id, campus_id, progress):
         for index in sorted(statuses_by_index)
     ]
     return True, overview_rows, detail_by_email
-
-
-def is_true_value(value):
-    return str(value).strip().lower() == "true"
 
 
 def project_progress_value(project):
@@ -657,62 +681,6 @@ def project_progress_value(project):
     if status == "creating_group":
         return 30
     return 10 if status else 0
-
-
-def project_chart_rows(detail_by_email):
-    projects = {}
-
-    for status in detail_by_email.values():
-        for project in status.get("intra_projects", []):
-            project_name = project.get("project_name") or project.get("project_slug")
-            if not project_name:
-                continue
-            row = projects.setdefault(
-                project_name,
-                {
-                    "project": project_name,
-                    "completed": 0,
-                    "doing": 0,
-                    "attempted": 0,
-                },
-            )
-            row["attempted"] += 1
-            if is_true_value(project.get("validated")):
-                row["completed"] += 1
-            elif project.get("status") in {
-                "creating_group",
-                "in_progress",
-                "waiting_for_correction",
-            }:
-                row["doing"] += 1
-
-    return sorted(
-        projects.values(),
-        key=lambda row: (row["completed"], row["doing"], row["attempted"], row["project"]),
-        reverse=True,
-    )
-
-
-def student_chart_rows(overview_rows):
-    rows = []
-    for row in overview_rows:
-        doing_count = len(
-            [
-                project
-                for project in row.get("current_projects", "").split(", ")
-                if project
-            ]
-        )
-        rows.append(
-            {
-                "student": row["student"],
-                "validated": row["validated_projects"],
-                "finished": row["finished_projects"],
-                "doing": doing_count,
-                "commits": row.get("repo_commit_count") or 0,
-            }
-        )
-    return rows
 
 
 def update_repo_collaborators(repos, github_username, permission):
@@ -1470,6 +1438,7 @@ with tab_project_status:
             progress = st.progress(0)
             ok, overview_rows_or_error, detail_by_email = fetch_project_statuses_parallel(
                 roster=roster,
+                course_run=course_run,
                 cursus_id=project_cursus_id,
                 campus_id=project_campus_id,
                 progress=progress,
@@ -1484,6 +1453,13 @@ with tab_project_status:
         overview_rows = st.session_state.get("project_status_overview", [])
         if overview_rows:
             detail_by_email = st.session_state.get("project_status_detail_by_email", {})
+            cached_count = sum(
+                1
+                for status in detail_by_email.values()
+                if status.get("cache_notice")
+            )
+            if cached_count:
+                st.warning(f"Using cached project status for {cached_count} students after fetch errors.")
             stats_cols = st.columns(4)
             stats_cols[0].metric("Students", len(overview_rows))
             stats_cols[1].metric(
@@ -1500,24 +1476,31 @@ with tab_project_status:
             )
 
             project_rows = project_chart_rows(detail_by_email)
-            student_rows = student_chart_rows(overview_rows)
+            student_rows = student_progress_rows(detail_by_email)
 
             if project_rows:
                 st.subheader("Project completion")
                 project_chart_df = pd.DataFrame(project_rows).set_index("project")
                 st.bar_chart(
-                    project_chart_df[["completed", "doing", "attempted"]],
+                    project_chart_df[["completed", "attempted", "doing"]],
                     width="stretch",
                 )
             else:
                 st.info("No Intra project data available for project charts.")
 
             if student_rows:
-                st.subheader("Student progress")
+                st.subheader("Student Python module progress")
                 student_chart_df = pd.DataFrame(student_rows).set_index("student")
                 st.bar_chart(
-                    student_chart_df[["validated", "finished", "doing"]],
+                    student_chart_df[["finished", "waiting_for_correction", "in_progress"]],
                     width="stretch",
+                )
+                progress_df = pd.DataFrame(student_rows)
+                st.download_button(
+                    label="Download student progress CSV",
+                    data=progress_df.to_csv(index=False),
+                    file_name=f"{course_run}_student_python_progress.csv",
+                    mime="text/csv",
                 )
 
             overview_df = pd.DataFrame(overview_rows)

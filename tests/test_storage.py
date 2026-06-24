@@ -6,15 +6,45 @@ from storage import (
     archive_course_run,
     create_course_run,
     delete_course_run,
+    get_project_status_cache,
     init_db,
     list_course_runs,
     list_roster_rows,
+    save_project_status_cache,
     save_roster_rows,
     update_roster_rows,
 )
 
 
 class StorageTest(unittest.TestCase):
+    def test_project_status_cache_round_trips_status_json(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "test.sqlite3"
+            init_db(db_path)
+
+            save_project_status_cache(
+                db_path,
+                "discovery",
+                "student@example.com",
+                {
+                    "overview": {"student": "Student"},
+                    "github": {"repo_commit_count": 3},
+                    "intra_projects": [{"project_name": "Module 0"}],
+                    "intra_error": "",
+                },
+            )
+            cached = get_project_status_cache(
+                db_path,
+                "discovery",
+                "student@example.com",
+            )
+
+        self.assertEqual(cached["overview"], {"student": "Student"})
+        self.assertEqual(cached["github"], {"repo_commit_count": 3})
+        self.assertEqual(cached["intra_projects"], [{"project_name": "Module 0"}])
+        self.assertEqual(cached["intra_error"], "")
+        self.assertTrue(cached["cache_updated_at"])
+
     def test_create_and_list_course_runs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "test.sqlite3"

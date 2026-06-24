@@ -10,9 +10,11 @@ from provisioning import (
     normalize_topic,
     prepare_intra_user_rows,
     prepare_individual_repo_rows,
+    project_chart_rows,
     read_roster_csv,
     roster_topics,
     select_roster_rows,
+    student_progress_rows,
     unique_repo_rows,
     validate_roster,
 )
@@ -106,6 +108,138 @@ class ProvisioningTest(unittest.TestCase):
         roster = validate_roster(read_roster_csv(csv_file), course_run="Discovery 2026")
 
         self.assertEqual(roster[0]["last_name"], "Doe")
+
+    def test_project_chart_rows_counts_unique_users_by_highest_status(self):
+        rows = project_chart_rows(
+            {
+                "one@example.com": {
+                    "intra_projects": [
+                        {
+                            "project_name": "Python",
+                            "status": "in_progress",
+                            "validated": "",
+                        },
+                        {
+                            "project_name": "Python",
+                            "status": "finished",
+                            "validated": "True",
+                        },
+                    ]
+                },
+                "two@example.com": {
+                    "intra_projects": [
+                        {
+                            "project_name": "Python",
+                            "status": "finished",
+                            "validated": "False",
+                            "final_mark": "50",
+                        },
+                        {
+                            "project_name": "Web",
+                            "status": "in_progress",
+                            "validated": "",
+                        },
+                    ]
+                },
+            }
+        )
+
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "project": "Python",
+                    "completed": 1,
+                    "attempted": 1,
+                    "doing": 0,
+                },
+                {
+                    "project": "Web",
+                    "completed": 0,
+                    "attempted": 0,
+                    "doing": 1,
+                },
+            ],
+        )
+
+    def test_student_progress_rows_counts_python_modules_by_progress_status(self):
+        rows = student_progress_rows(
+            {
+                "one@example.com": {
+                    "overview": {
+                        "student": "One Student",
+                        "email": "one@example.com",
+                    },
+                    "intra_projects": [
+                        {
+                            "project_name": "Discovery Piscine - Python - Module 0",
+                            "status": "finished",
+                            "validated": "True",
+                        },
+                        {
+                            "project_name": "Discovery Piscine - Python - Module 1",
+                            "status": "in_progress",
+                            "validated": "",
+                        },
+                        {
+                            "project_name": "Discovery Piscine - Python - Module 2",
+                            "status": "waiting_for_correction",
+                            "validated": "False",
+                        },
+                    ],
+                },
+                "two@example.com": {
+                    "overview": {
+                        "student": "Two Student",
+                        "email": "two@example.com",
+                    },
+                    "intra_projects": [
+                        {
+                            "project_slug": "discovery-piscine-python-module-3",
+                            "status": "finished",
+                            "validated": "True",
+                        }
+                    ],
+                },
+                "zero@example.com": {
+                    "overview": {
+                        "student": "Zero Student",
+                        "email": "zero@example.com",
+                    },
+                    "intra_projects": [
+                        {
+                            "project_name": "Discovery Piscine - Python - Module 0",
+                            "status": "in_progress",
+                            "validated": "",
+                        }
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "student": "One Student",
+                    "finished": 1,
+                    "waiting_for_correction": 1,
+                    "in_progress": 1,
+                },
+                {
+                    "student": "Two Student",
+                    "finished": 1,
+                    "waiting_for_correction": 0,
+                    "in_progress": 0,
+                },
+                {
+                    "student": "Zero Student",
+                    "finished": 0,
+                    "waiting_for_correction": 0,
+                    "in_progress": 1,
+                },
+            ],
+        )
 
     def test_prepare_individual_repo_rows_requires_intra_or_repo_name(self):
         with self.assertRaisesRegex(ValueError, "missing repo_name"):
